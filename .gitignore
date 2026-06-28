@@ -1,0 +1,18 @@
+.venv
+Detect-Indian-Currency-1/
+Detect-Indian-Currency-2/
+yolo26n.pt
+yolo26m.pt
+yolo26_currency_run/
+__pycache__/
+*.onnx
+Testimages
+testimages object/
+*.zip
+Detect-Indian-Currency-*/
+wandb/
+ven/
+ai-sdk/examples/yolov5
+# Data and SDKs
+docker_data/
+docker_images_v2.0.x/

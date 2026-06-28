@@ -1,0 +1,368 @@
+import cv2
+import asyncio
+import websockets
+import numpy as np
+import time
+import subprocess
+import json
+import os
+
+BASE_PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+from periphery import GPIO # Specific for Radxa periphery library
+import logging
+import coloredlogs
+
+# Configure Logging
+LOG_DIR = os.path.join(BASE_PROJECT_DIR, "logs", "board")
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOG_DIR, "board.log")
+
+log_fmt = "%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s"
+date_fmt = "%Y-%m-%d %H:%M:%S"
+
+import logging.handlers
+logging.basicConfig(
+    level=logging.DEBUG,
+    format=log_fmt,
+    datefmt=date_fmt,
+    handlers=[
+        logging.StreamHandler(),
+        logging.handlers.RotatingFileHandler(
+            LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+        ),
+    ],
+)
+logger = logging.getLogger("BoardClient")
+import coloredlogs
+coloredlogs.install(level='DEBUG', logger=logger, fmt=log_fmt, datefmt=date_fmt)
+logger.info(f"=== Board Client Starting — logs → {LOG_FILE} ===")
+
+
+
+# --- Configuration ---
+LAPTOP_IP = "172.20.10.2"
+SERVER_URL = f"ws://{LAPTOP_IP}:8000/vision"
+
+# USB Camera Configuration (as requested)
+CAMERA_INDEX = "/dev/video0"
+CAP_DRIVER = cv2.CAP_V4L2
+
+# GPIO Configuration (from your gpio_test.py)
+GPIO_CHIP = "/dev/gpiochip0"
+GPIO_LINE = 108   # PD12
+
+# Piper TTS Configuration
+PIPER_EXE = f"{BASE_PROJECT_DIR}/ven/bin/piper" 
+PIPER_MODEL = f"{BASE_PROJECT_DIR}/backend/tts/models/en_GB-alba-medium.onnx"
+
+def get_sample_rate(model_path):
+    json_path = model_path + ".json"
+    if os.path.exists(json_path):
+        try:
+            with open(json_path, 'r') as f:
+                data = json.load(f)
+                return data.get("audio", {}).get("sample_rate", 22050)
+        except Exception:
+            pass
+    return 22050
+
+PIPER_SAMPLE_RATE = get_sample_rate(PIPER_MODEL)
+
+tts_queue = asyncio.Queue()
+
+# Removed play_voice in favor of a persistent worker in tts_worker
+
+
+async def tts_worker():
+    """
+    Producer-Consumer TTS — Piper and aplay stay alive forever.
+
+    Flow:
+      Main loop puts text in tts_queue (producer).
+      This worker writes to Piper stdin (consumer).
+      A background pipe_audio task streams Piper stdout → aplay in real-time.
+      First word plays in ~200ms. No cold-start delay after warmup.
+
+    Sync (how we know when to send READY):
+      We track bytes_piped (bytes sent to aplay) and stream_start_time.
+      finish_time = stream_start_time + (bytes_piped / BYTES_PER_SEC)
+      We wait until that precise moment before sending READY to the server.
+    """
+    BYTES_PER_SEC = PIPER_SAMPLE_RATE * 2  # 16-bit mono = 2 bytes/sample
+
+    # ── Start Piper — stays alive forever ──────────────────────────────────
+    piper_proc = await asyncio.create_subprocess_exec(
+        PIPER_EXE, "--model", PIPER_MODEL, "--output-raw",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL
+    )
+
+    # ── Start aplay — stays alive forever, receives Piper's stream ─────────
+    aplay_proc = await asyncio.create_subprocess_exec(
+        "aplay", "-r", str(PIPER_SAMPLE_RATE), "-f", "S16_LE", "-t", "raw", "-",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL
+    )
+
+    # Shared state (updated by pipe_audio, read by SIGNAL_READY handler)
+    bytes_piped = 0
+    stream_start_time = None
+
+    async def pipe_audio():
+        """Real-time bridge: Piper stdout → aplay stdin. Updates byte counters."""
+        nonlocal bytes_piped, stream_start_time
+        chunk_n = 0
+        try:
+            while True:
+                chunk = await piper_proc.stdout.read(4096)
+                if not chunk:
+                    break
+                if stream_start_time is None:
+                    stream_start_time = time.time()
+                    logger.debug("[TTS►PIPE] First audio chunk received — aplay stream started")
+                if aplay_proc.stdin:
+                    aplay_proc.stdin.write(chunk)
+                    await aplay_proc.stdin.drain()
+                    bytes_piped += len(chunk)
+                    chunk_n += 1
+                    logger.debug(
+                        f"[TTS►PIPE] chunk#{chunk_n} +{len(chunk)}B  "
+                        f"total={bytes_piped}B  "
+                        f"~{bytes_piped/BYTES_PER_SEC:.2f}s audio queued to aplay"
+                    )
+        except Exception as e:
+            logger.error(f"[TTS►PIPE ERROR] {e}")
+
+    asyncio.create_task(pipe_audio())
+
+    # ── Warm-up: prime the ONNX engine so first real narration has no lag ──
+    logger.info("TTS Worker: Warming up Piper (priming ONNX engine)...")
+    piper_proc.stdin.write(b" \n")
+    await piper_proc.stdin.drain()
+    await asyncio.sleep(2.0)       # Wait for warmup audio to play through
+    stream_start_time = None       # Reset — warmup doesn't count
+    bytes_piped = 0
+    logger.info("TTS Worker: Ready. Streaming mode active.")
+
+    try:
+        while True:
+            text = await tts_queue.get()
+
+            if text == "SIGNAL_READY":
+                logger.debug("[TTS►SYNC] SIGNAL_READY received — waiting for Piper to START producing audio...")
+
+                # ── STEP 1: Wait until Piper has actually started producing audio ──
+                # This is the fix for the race condition:
+                # SIGNAL_READY can arrive before Piper generates any bytes.
+                # We gate here until bytes_piped > 0 (up to 8s timeout).
+                wait_start = time.time()
+                while bytes_piped == 0:
+                    if time.time() - wait_start > 8.0:
+                        logger.warning("[TTS►SYNC] Timeout waiting for Piper audio — no bytes after 8s")
+                        break
+                    await asyncio.sleep(0.05)
+
+                logger.debug(f"[TTS►SYNC] Piper started — initial bytes: {bytes_piped}B (waited {time.time()-wait_start:.2f}s)")
+
+                # ── STEP 2: Wait for Piper to STOP producing (byte count stable) ──
+                stable_count = 0
+                prev_bytes = bytes_piped
+                while stable_count < 3:  # 300ms of no new bytes = generation done
+                    await asyncio.sleep(0.1)
+                    if bytes_piped == prev_bytes:
+                        stable_count += 1
+                    else:
+                        stable_count = 0
+                        prev_bytes = bytes_piped
+
+                logger.debug(f"[TTS►SYNC] Piper settled — total audio piped: {bytes_piped}B (~{bytes_piped/BYTES_PER_SEC:.2f}s)")
+
+                # ── STEP 3: Wait until aplay physically finishes playing ──────────
+                if stream_start_time is not None and bytes_piped > 0:
+                    finish_time = stream_start_time + (bytes_piped / BYTES_PER_SEC)
+                    wait_for = finish_time - time.time() + 0.15
+                    if wait_for > 0:
+                        logger.info(
+                            f"[TTS►SYNC] Waiting {wait_for:.2f}s for speaker to finish  "
+                            f"(bytes={bytes_piped}  duration={bytes_piped/BYTES_PER_SEC:.2f}s)"
+                        )
+                        await asyncio.sleep(wait_for)
+                    else:
+                        logger.debug(f"[TTS►SYNC] aplay already done (wait_for={wait_for:.2f}s)")
+
+                logger.info("[TTS►SYNC] Speaker finished. Resetting counters.")
+                # ── Reset for next narration ───────────────────────────────
+                stream_start_time = None
+                bytes_piped = 0
+
+                tts_queue.task_done()
+                continue
+
+            # ── Normal text — write to persistent Piper immediately ────────
+            if text and text.strip():
+                logger.info(f"[TTS►PIPER] Sending text ({len(text.split())} words, {len(text)} chars): '{text[:80]}{'...' if len(text)>80 else ''}'")
+                piper_proc.stdin.write((text + "\n").encode("utf-8"))
+                await piper_proc.stdin.drain()
+                logger.debug("[TTS►PIPER] Text written to Piper stdin")
+
+            tts_queue.task_done()
+
+    except Exception as e:
+        logger.error(f"TTS Worker Loop Error: {e}")
+    finally:
+        for proc in [piper_proc, aplay_proc]:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+
+async def board_main():
+    logger.info("Starting AI Vision Client...")
+
+    
+    # Initialize Camera
+    logger.info(f"Initializing camera at {CAMERA_INDEX}...")
+    cap = cv2.VideoCapture(CAMERA_INDEX, CAP_DRIVER)
+    if not cap.isOpened():
+        logger.error(f"Could not open camera at {CAMERA_INDEX}")
+        return
+    logger.info("Camera initialized successfully.")
+
+    # Initialize GPIO Button
+    logger.info(f"Initializing GPIO pin {GPIO_LINE} on {GPIO_CHIP}...")
+    try:
+        button = GPIO(GPIO_CHIP, GPIO_LINE, "in")
+        logger.info("GPIO initialized successfully.")
+    except Exception as e:
+        logger.error(f"Error initializing GPIO: {e}")
+        return
+
+
+    current_mode_idx = 0 # 0: ObjectDetection, 1: Currency, 2: OCR
+    modes = ["ObjectDetection", "Currency", "OCR"]
+    
+    # Main Streaming Loop
+    try:
+        logger.info(f"Connecting to AI Server at {SERVER_URL}...")
+        async with websockets.connect(SERVER_URL) as websocket:
+            logger.info("Connection established.")
+            
+            # Start TTS Worker
+            tts_task = asyncio.create_task(tts_worker())
+            
+            tts_buffer = ""
+            while cap.isOpened():
+                # 1. Read Button for Mode Switching
+                btn_val = button.read()
+                if btn_val != 0: 
+                    current_mode_idx = (current_mode_idx + 1) % 3
+                    logger.warning(f"*** MODE SWITCHED TO: {modes[current_mode_idx]} ***")
+                    time.sleep(0.3) # Simple hardware debounce
+
+                # 2. Capture Frame
+                ret, frame = cap.read()
+                if not ret:
+                    logger.error("Failed to grab frame.")
+                    break
+                
+                frame = cv2.resize(frame, (320, 240))
+                
+                # 3. Encode Frame
+                _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
+                
+                # 4. Pack and Send
+                t_send = time.time()
+                payload = bytes([current_mode_idx]) + buffer.tobytes()
+                await websocket.send(payload)
+                logger.debug(
+                    f"[FRAME►TX] frame sent  mode={modes[current_mode_idx]}  "
+                    f"size={len(payload)}B  t={time.strftime('%H:%M:%S')}"
+                )
+                
+                # 4.5 Local Visualization (Requested)
+                try:
+                    cv2.imshow("Board Feed (Real-time)", frame)
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        break
+                except Exception as e:
+                    # Catch-all to prevent any GUI related error from killing the client
+                    if not hasattr(board_main, "_gui_error_logged"):
+                        logger.warning(f"Local GUI visualization failed: {e}. Continuing in headless mode...")
+                        board_main._gui_error_logged = True
+                    
+                print(f"[Board] Streaming {modes[current_mode_idx]}...", end="\r")
+
+                # 5. Handle Incoming AI Responses (Asynchronous)
+                try:
+                    # Non-blocking check for responses
+                    response_raw = await asyncio.wait_for(websocket.recv(), timeout=0.001)
+                    data = json.loads(response_raw)
+                    
+                    if data['type'] == 'text':
+                        content = data['content']
+                        print(content, end="", flush=True)
+                        logger.debug(f"[LLM◄RX] text chunk len={len(content)} '{content[:40]}'")
+                        # Accumulate the FULL response
+                        tts_buffer += content
+
+                    elif data['type'] == 'status' and data['content'] == 'done':
+                        print("\n")
+                        response_len = len(tts_buffer)
+                        word_count = len(tts_buffer.split())
+                        logger.info(
+                            f"[LLM◄DONE] Full response received  "
+                            f"chars={response_len}  words={word_count}  "
+                            f"text='{tts_buffer.strip()[:100]}{'...' if response_len>100 else ''}'"
+                        )
+
+                        if tts_buffer.strip():
+                            logger.info(f"[TTS►QUEUE] Queuing full response for TTS ({word_count} words)")
+                            tts_queue.put_nowait(tts_buffer.strip())
+                        tts_buffer = ""
+
+                        logger.debug("[SYNC] Queuing SIGNAL_READY and joining queue...")
+                        t_sync_start = time.time()
+                        tts_queue.put_nowait("SIGNAL_READY")
+                        await tts_queue.join()
+                        t_sync_end = time.time()
+                        logger.info(
+                            f"[SYNC] TTS complete  "
+                            f"total_speech_time={(t_sync_end - t_sync_start):.2f}s"
+                        )
+
+                        await websocket.send(json.dumps({"type": "ready"}))
+                        logger.info("[READY►TX] Sent READY to server")
+
+                    elif data['type'] == 'heartbeat':
+                        logger.debug("[HB◄RX] Heartbeat from server")
+                        
+                except asyncio.TimeoutError:
+                    pass
+                except Exception as e:
+                    # Catch-all for websocket or parsing errors in this block
+                    logger.error(f"Error handling response: {e}")
+
+                
+    except Exception as e:
+        logger.error(f"Connection Error: {e}")
+    finally:
+        cap.release()
+        button.close()
+        # Drain the queue to stop further speech
+        while not tts_queue.empty():
+            try: tts_queue.get_nowait(); tts_queue.task_done()
+            except: break
+        if not tts_task.done():
+            tts_task.cancel()
+        logger.info("Client shut down.")
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.get_event_loop().run_until_complete(board_main())
+    except KeyboardInterrupt:
+        print("\n[Board] Stopped by user.")
