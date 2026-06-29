@@ -4,6 +4,7 @@ opencv-python-headless
 websockets
 requests
 RPi.GPIO
+piper-
 # (Assuming Piper CLI is manually installed as per project files)
 # libcanberra-pulse (needed for sound output on some boards)
 # ffmpeg
