@@ -1,0 +1,26 @@
+# TTS Module Requirements (configure_piper.py)
+# All stdlib imports (subprocess, os, sys, time, json, platform) require no installation.
+
+# --- Windows (Laptop) ---
+# Used for streaming raw PCM audio from Piper on Windows
+numpy
+sounddevice
+# winsound is built into Python on Windows - no install needed
+
+# --- Linux / Radxa Board ---
+# Audio playback is handled by the system `aplay` command (ALSA)
+# Install via: sudo apt install alsa-utils
+# No additional Python packages required for Linux audio playback
+
+# --- Piper Binary ---
+# Windows: place piper.exe + DLLs in backend/tts/piper/
+#   Download: https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_windows_amd64.zip
+# Linux/Radxa: install via pip in your venv
+#   pip install piper-tts
+#   OR use the binary from: https://github.com/rhasspy/piper/releases
+
+# --- Voice Model ---
+# Place in backend/tts/models/
+#   en_GB-alba-medium.onnx       (model weights, ~63MB)
+#   en_GB-alba-medium.onnx.json  (model config)
+# Download: https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_GB/alba/medium/en_GB-alba-medium.onnx
