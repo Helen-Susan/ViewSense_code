@@ -1,1 +1,0 @@
---inputs x --outputs logits --input-size-list 28,28,1

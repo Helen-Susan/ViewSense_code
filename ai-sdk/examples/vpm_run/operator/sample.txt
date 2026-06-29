@@ -1,5 +1,0 @@
-[network]
-./network_binary.nb
-[input]
-./input_0.dat
-
